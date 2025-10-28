@@ -1,6 +1,7 @@
 // file: src/main/kotlin/com/github/mwguerra/copyfilecontent/CopyFileContentAction.kt
 package com.github.mwguerra.copyfilecontent
 
+import com.github.mwguerra.copyfilecontent.filter.FilterEngine
 import com.intellij.notification.NotificationAction
 import com.intellij.notification.NotificationGroupManager
 import com.intellij.notification.NotificationType
@@ -51,21 +52,46 @@ class CopyFileContentAction : AnAction() {
             return
         }
 
+        val state = settings.state
+        val repositoryRoot = getRepositoryRoot(project)
+        val filterEngine = FilterEngine(state, repositoryRoot)
+
         val fileContents = mutableListOf<String>().apply {
-            add(settings.state.preText)
+            add(state.preText)
         }
 
         for (file in filesToCopy) {
-            // Check file limit only if the checkbox is selected.
-            if (settings.state.setMaxFileCount && fileCount >= settings.state.fileCountLimit) {
+            if (state.setMaxFileCount && fileCount >= state.fileCountLimit) {
                 fileLimitReached = true
                 break
             }
 
             val content = if (file.isDirectory) {
-                processDirectory(file, fileContents, copiedFilePaths, project, settings.state.addExtraLineBetweenFiles)
+                processDirectory(
+                    directory = file,
+                    fileContents = fileContents,
+                    copiedFilePaths = copiedFilePaths,
+                    project = project,
+                    state = state,
+                    repositoryRoot = repositoryRoot,
+                    engine = filterEngine,
+                    addExtraLine = state.addExtraLineBetweenFiles,
+                )
             } else {
-                processFile(file, fileContents, copiedFilePaths, project, settings.state.addExtraLineBetweenFiles)
+                processFile(
+                    file = file,
+                    fileContents = fileContents,
+                    copiedFilePaths = copiedFilePaths,
+                    project = project,
+                    state = state,
+                    repositoryRoot = repositoryRoot,
+                    engine = filterEngine,
+                    addExtraLine = state.addExtraLineBetweenFiles,
+                )
+            }
+
+            if (content.isEmpty()) {
+                continue
             }
 
             totalChars += content.length
@@ -74,19 +100,32 @@ class CopyFileContentAction : AnAction() {
             totalTokens += estimateTokens(content)
         }
 
-        fileContents.add(settings.state.postText)
-        copyToClipboard(fileContents.joinToString(separator = "\n"))
-
         if (fileLimitReached) {
             val fileLimitWarningMessage = """
                 <html>
-                <b>File Limit Reached:</b> The file limit of ${settings.state.fileCountLimit} files was reached.
+                <b>File Limit Reached:</b> The file limit of ${state.fileCountLimit} files was reached.
                 </html>
             """.trimIndent()
             showNotificationWithSettingsAction(fileLimitWarningMessage, NotificationType.WARNING, project)
         }
 
-        if (settings.state.showCopyNotification) {
+        if (fileCount == 0) {
+            val message = """
+                <html>
+                <b>No files qualified</b> based on your current filtering rules and limits.
+                </html>
+            """.trimIndent()
+            val notification = showNotification(message, NotificationType.INFORMATION, project)
+            notification.addAction(NotificationAction.createSimple("View Filter Rules") {
+                openSettings(project)
+            })
+            return
+        }
+
+        fileContents.add(state.postText)
+        copyToClipboard(fileContents.joinToString(separator = "\n"))
+
+        if (state.showCopyNotification) {
             val fileCountMessage = when (fileCount) {
                 1 -> "1 file copied."
                 else -> "$fileCount files copied."
@@ -112,12 +151,18 @@ class CopyFileContentAction : AnAction() {
         return words.size + punctuation
     }
 
-    private fun processFile(file: VirtualFile, fileContents: MutableList<String>, copiedFilePaths: MutableSet<String>, project: Project, addExtraLine: Boolean): String {
-        val settings = CopyFileContentSettings.getInstance(project) ?: return ""
-        val repositoryRoot = getRepositoryRoot(project)
+    private fun processFile(
+        file: VirtualFile,
+        fileContents: MutableList<String>,
+        copiedFilePaths: MutableSet<String>,
+        project: Project,
+        state: CopyFileContentSettings.State,
+        repositoryRoot: VirtualFile?,
+        engine: FilterEngine,
+        addExtraLine: Boolean,
+    ): String {
         val fileRelativePath = repositoryRoot?.let { root -> VfsUtil.getRelativePath(file, root, '/') } ?: file.path
 
-        // Skip already copied files
         if (fileRelativePath in copiedFilePaths) {
             logger.info("Skipping already copied file: $fileRelativePath")
             return ""
@@ -125,57 +170,90 @@ class CopyFileContentAction : AnAction() {
 
         copiedFilePaths.add(fileRelativePath)
 
-        var content = ""
-
-        // If filename filters are enabled and the file extension does not match any filter, return early
-        if (settings.state.useFilenameFilters) {
-            if (settings.state.filenameFilters.none { filter -> file.name.endsWith(filter) }) {
-                logger.info("Skipping file: ${file.name} - Extension does not match any filter")
-                return ""
-            }
+        val (shouldInclude, _) = engine.shouldInclude(file)
+        if (!shouldInclude) {
+            return ""
         }
 
-        if (!isBinaryFile(file) && file.length <= settings.state.maxFileSizeKB * 1024) {
-            val header = settings.state.headerFormat.replace("\$FILE_PATH", fileRelativePath)
-            // Check if the file is already loaded in-memory by the editor
-            content = if (settings.state.strictMemoryRead) {
-                // Strict mode: only read from memory if file is actually open in an editor
-                val fileEditorManager = com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project)
-                if (fileEditorManager.isFileOpen(file)) {
-                    FileDocumentManager.getInstance().getCachedDocument(file)?.text ?: readFileContents(file)
-                } else {
-                    readFileContents(file)  // File not open, read from disk
-                }
-            } else {
-                // Non-strict mode: use cached document if available (better performance)
+        if (isBinaryFile(file)) {
+            logger.info("Skipping file: ${file.name} - Binary file type")
+            return ""
+        }
+
+        if (file.length > state.maxFileSizeKB * 1024) {
+            logger.info("Skipping file: ${file.name} - Size limit exceeded")
+            return ""
+        }
+
+        val header = state.headerFormat.replace("\$FILE_PATH", fileRelativePath)
+        val content = if (state.strictMemoryRead) {
+            val fileEditorManager = com.intellij.openapi.fileEditor.FileEditorManager.getInstance(project)
+            if (fileEditorManager.isFileOpen(file)) {
                 FileDocumentManager.getInstance().getCachedDocument(file)?.text ?: readFileContents(file)
-            }
-            fileContents.add(header)
-            fileContents.add(content)
-            fileCount++
-            if (addExtraLine && content.isNotEmpty()) {
-                fileContents.add("")
+            } else {
+                readFileContents(file)
             }
         } else {
-            logger.info("Skipping file: ${file.name} - Binary or size limit exceeded")
+            FileDocumentManager.getInstance().getCachedDocument(file)?.text ?: readFileContents(file)
         }
+
+        fileContents.add(header)
+        fileContents.add(content)
+        fileCount++
+        if (addExtraLine && content.isNotEmpty()) {
+            fileContents.add("")
+        }
+
         return content
     }
 
-    private fun processDirectory(directory: VirtualFile, fileContents: MutableList<String>, copiedFilePaths: MutableSet<String>, project: Project, addExtraLine: Boolean): String {
+    private fun processDirectory(
+        directory: VirtualFile,
+        fileContents: MutableList<String>,
+        copiedFilePaths: MutableSet<String>,
+        project: Project,
+        state: CopyFileContentSettings.State,
+        repositoryRoot: VirtualFile?,
+        engine: FilterEngine,
+        addExtraLine: Boolean,
+    ): String {
+        if (!engine.shouldEnterDirectory(directory)) {
+            logger.info("Skipping directory due to filters: ${directory.path}")
+            return ""
+        }
+
         val directoryContent = StringBuilder()
-        val settings = CopyFileContentSettings.getInstance(project) ?: return ""
 
         for (childFile in directory.children) {
-            if (settings.state.setMaxFileCount && fileCount >= settings.state.fileCountLimit) {
+            if (state.setMaxFileCount && fileCount >= state.fileCountLimit) {
                 fileLimitReached = true
                 break
             }
+
             val content = if (childFile.isDirectory) {
-                processDirectory(childFile, fileContents, copiedFilePaths, project, addExtraLine)
+                processDirectory(
+                    directory = childFile,
+                    fileContents = fileContents,
+                    copiedFilePaths = copiedFilePaths,
+                    project = project,
+                    state = state,
+                    repositoryRoot = repositoryRoot,
+                    engine = engine,
+                    addExtraLine = addExtraLine,
+                )
             } else {
-                processFile(childFile, fileContents, copiedFilePaths, project, addExtraLine)
+                processFile(
+                    file = childFile,
+                    fileContents = fileContents,
+                    copiedFilePaths = copiedFilePaths,
+                    project = project,
+                    state = state,
+                    repositoryRoot = repositoryRoot,
+                    engine = engine,
+                    addExtraLine = addExtraLine,
+                )
             }
+
             if (content.isNotEmpty()) {
                 directoryContent.append(content)
             }
@@ -224,9 +302,13 @@ class CopyFileContentAction : AnAction() {
     private fun showNotificationWithSettingsAction(message: String, notificationType: NotificationType, project: Project?) {
         val notificationGroup = NotificationGroupManager.getInstance().getNotificationGroup("Copy File Content")
         val notification = notificationGroup.createNotification(message, notificationType).setImportant(true)
-        notification.addAction(NotificationAction.createSimple("Go to Settings") {
-            ShowSettingsUtil.getInstance().showSettingsDialog(project, "Copy File Content Settings")
+        notification.addAction(NotificationAction.createSimple("View Filter Rules") {
+            openSettings(project)
         })
         notification.notify(project)
+    }
+
+    private fun openSettings(project: Project?) {
+        ShowSettingsUtil.getInstance().showSettingsDialog(project, "Copy File Content Settings")
     }
 }

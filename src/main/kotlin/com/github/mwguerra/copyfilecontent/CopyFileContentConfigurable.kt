@@ -1,348 +1,386 @@
 package com.github.mwguerra.copyfilecontent
 
+import com.github.mwguerra.copyfilecontent.filter.OverlapPolicy
+import com.github.mwguerra.copyfilecontent.filter.RulePresets
+import com.github.mwguerra.copyfilecontent.ui.FilterPreviewDialog
+import com.github.mwguerra.copyfilecontent.ui.RuleTable
 import com.intellij.openapi.options.Configurable
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.roots.ProjectRootManager
 import com.intellij.openapi.ui.Messages
 import com.intellij.ui.IdeBorderFactory
 import com.intellij.ui.JBColor
+import com.intellij.ui.RoundedLineBorder
+import com.intellij.ui.ToolbarDecorator
 import com.intellij.ui.components.*
-import com.intellij.ui.table.JBTable
-import com.intellij.util.ui.FormBuilder
+import com.intellij.ui.components.JBLabel
+import com.intellij.ui.components.JBTabbedPane
+import com.intellij.ui.components.panels.HorizontalLayout
+import com.intellij.ui.components.panels.VerticalLayout
 import com.intellij.util.ui.JBUI
+import com.intellij.util.ui.UIUtil
 import java.awt.*
 import javax.swing.*
-import javax.swing.table.DefaultTableModel
-import com.intellij.ui.RoundedLineBorder
 
 class CopyFileContentConfigurable(private val project: Project) : Configurable {
+
     private var settings: CopyFileContentSettings? = null
+
+    // ---------- Basic editors ----------
     private val headerFormatArea = JBTextArea(4, 20).apply {
-        border = JBUI.Borders.merge(
-            JBUI.Borders.empty(5),
-            RoundedLineBorder(JBColor.LIGHT_GRAY, 4, 1),
-            true
-        )
+        border = JBUI.Borders.merge(JBUI.Borders.empty(5), RoundedLineBorder(JBColor.LIGHT_GRAY, 4, 1), true)
+        lineWrap = true
+        wrapStyleWord = true
     }
-
     private val preTextArea = JBTextArea(4, 20).apply {
-        border = JBUI.Borders.merge(
-            JBUI.Borders.empty(5),
-            RoundedLineBorder(JBColor.LIGHT_GRAY, 4, 1),
-            true
-        )
+        border = JBUI.Borders.merge(JBUI.Borders.empty(5), RoundedLineBorder(JBColor.LIGHT_GRAY, 4, 1), true)
+        lineWrap = true
+        wrapStyleWord = true
+    }
+    private val postTextArea = JBTextArea(4, 20).apply {
+        border = JBUI.Borders.merge(JBUI.Borders.empty(5), RoundedLineBorder(JBColor.LIGHT_GRAY, 4, 1), true)
+        lineWrap = true
+        wrapStyleWord = true
     }
 
-    private val postTextArea = JBTextArea(4, 20).apply {
-        border = JBUI.Borders.merge(
-            JBUI.Borders.empty(5),
-            RoundedLineBorder(JBColor.LIGHT_GRAY, 4, 1),
-            true
-        )
-    }
     private val extraLineCheckBox = JBCheckBox("Add an extra line between files")
     private val setMaxFilesCheckBox = JBCheckBox("Set maximum number of files to have their content copied")
     private val maxFilesField = JBTextField(10)
     private val maxFileSizeField = JBTextField(10)
+    private val showNotificationCheckBox = JBCheckBox("Show notification after copying")
+    private val useFilenameFiltersCheckBox = JBCheckBox("Enable include rules") // legacy toggle, drives "include rules on/off"
+    private val strictMemoryReadCheckBox = JBCheckBox("Strict memory reading (only read from memory if file is open in editor)")
+
     private val warningLabel = JLabel("<html><b>Warning:</b> Not setting a maximum number of files may cause high memory usage.</html>").apply {
         foreground = JBColor(0xA94442, 0xA94442)
         background = JBColor(0xF2DEDE, 0xF2DEDE)
-        border = JBUI.Borders.compound(
-            JBUI.Borders.empty(5),
-            BorderFactory.createLineBorder(JBColor(0xEBCCD1, 0xEBCCD1))
-        )
+        border = JBUI.Borders.compound(JBUI.Borders.empty(5), BorderFactory.createLineBorder(JBColor(0xEBCCD1, 0xEBCCD1)))
         isOpaque = true
         isVisible = false
     }
-    private val infoLabel = JLabel("<html><b>Info:</b> Please add file extensions to the table above.</html>").apply {
+
+    // ---------- Filtering UI (tables + toggles) ----------
+    private val includeTable = RuleTable()
+    private val excludeTable = RuleTable()
+
+    private val includeInfoLabel = JLabel("<html><b>Info:</b> When disabled, all files are candidates. Add rules to restrict what’s included.</html>").apply {
         foreground = JBColor(0x31708F, 0x31708F)
         background = JBColor(0xD9EDF7, 0xD9EDF7)
-        border = JBUI.Borders.compound(
-            JBUI.Borders.empty(5),
-            BorderFactory.createLineBorder(JBColor(0xBCE8F1, 0xBCE8F1))
-        )
+        border = JBUI.Borders.compound(JBUI.Borders.empty(5), BorderFactory.createLineBorder(JBColor(0xBCE8F1, 0xBCE8F1)))
         isOpaque = true
         isVisible = false
     }
-    private val showNotificationCheckBox = JBCheckBox("Show notification after copying")
-    private val useFilenameFiltersCheckBox = JBCheckBox("Enable file extension filtering")
-    private val strictMemoryReadCheckBox = JBCheckBox("Strict memory reading (only read from memory if file is open in editor)")
-    private val tableModel = DefaultTableModel()
-    private val table = JBTable(tableModel)
-    private val addButton = JButton("Add")
-    private val removeButton = JButton("Remove")
-    private val filenameFiltersPanel = createFilenameFiltersPanel()
 
+    private val useExcludeRulesCheck = JBCheckBox("Enable exclude rules")
+    private val matchDirectoriesCheck = JBCheckBox("Allow rules to gate directories")
+    private val matchHiddenFilesCheck = JBCheckBox("Include hidden files (dotfiles)")
+    private val overlapPolicyBox = JComboBox(OverlapPolicy.entries.toTypedArray())
+
+    private lateinit var includeDecorated: JComponent
+    private lateinit var excludeDecorated: JComponent
+    private val previewButton = JButton("Preview…")
+
+    // ---------- Lifecycle ----------
     init {
-        tableModel.addColumn("File Extensions")
-        setupTable()
-
         setMaxFilesCheckBox.addActionListener {
-            val maxFilesSelected = setMaxFilesCheckBox.isSelected
-            maxFilesField.isVisible = maxFilesSelected
-            warningLabel.isVisible = !maxFilesSelected
+            val on = setMaxFilesCheckBox.isSelected
+            maxFilesField.isVisible = on
+            warningLabel.isVisible = !on
         }
-
-        useFilenameFiltersCheckBox.addActionListener {
-            filenameFiltersPanel.isVisible = useFilenameFiltersCheckBox.isSelected
-            updateInfoLabelVisibility()
-        }
+        useFilenameFiltersCheckBox.addActionListener { updateIncludeEnabledState() }
+        useExcludeRulesCheck.addActionListener { updateExcludeEnabledState() }
+        previewButton.addActionListener { openPreviewDialog() }
     }
 
-    private fun updateInfoLabelVisibility() {
-        infoLabel.isVisible = useFilenameFiltersCheckBox.isSelected && tableModel.rowCount == 0
-    }
-
-    private fun setupTable() {
-        settings?.state?.filenameFilters?.forEach {
-            tableModel.addRow(arrayOf(it))
-        }
-
-        addButton.addActionListener {
-            val extension = Messages.showInputDialog("Enter file extension:", "Add Filter", null)
-            if (!extension.isNullOrBlank()) {
-                tableModel.addRow(arrayOf(extension.trim()))
-                updateInfoLabelVisibility()
-            }
-        }
-
-        removeButton.addActionListener {
-            val selectedRow = table.selectedRow
-            if (selectedRow != -1) {
-                tableModel.removeRow(selectedRow)
-                updateInfoLabelVisibility()
-            }
-        }
-    }
-
+    // ---------- Configurable ----------
     override fun createComponent(): JComponent {
         settings = CopyFileContentSettings.getInstance(project)
 
+        // Constraints section
+        val constraintsPanel = borderedSection("Constraints for copying") {
+            add(inlineRow(createWrappedCheckBoxPanel(setMaxFilesCheckBox), maxFilesField))
+            add(inlineRow(JLabel(), warningLabel))
+            add(labeledRow("Maximum file size (KB):", maxFileSizeField))
+            // Keep legacy include toggle here so it’s obvious this controls whether include rules are active
+            add(createWrappedCheckBoxPanel(useFilenameFiltersCheckBox))
+        }
+
+        // Filtering section (tabs + global row)
+        val filteringPanel = borderedSection("Filtering") {
+            add(buildFilteringTabs())
+            add(Box.createVerticalStrut(8))
+            add(buildFilteringGlobalRow())
+        }
+
+        // Text structure section
+        val textPanel = borderedSection("Text structure of what's going to the clipboard") {
+            add(labeledRow("Pre Text:", JBScrollPane(preTextArea)))
+            val headerRow = JPanel(BorderLayout())
+            headerRow.add(JBScrollPane(headerFormatArea), BorderLayout.CENTER)
+            val headerHelp = JBLabel("<html><small>Use <code>\$FILE_PATH</code> to insert the file’s path. Example: <code>// file: \$FILE_PATH</code></small></html>")
+            headerHelp.border = JBUI.Borders.emptyLeft(5)
+            headerRow.add(headerHelp, BorderLayout.SOUTH)
+            add(labeledRow("File Header Format:", headerRow))
+            add(labeledRow("Post Text:", JBScrollPane(postTextArea)))
+            add(createWrappedCheckBoxPanel(extraLineCheckBox))
+        }
+
+        // Reading / Feedback
+        val behaviorPanel = borderedSection("File reading & feedback") {
+            add(createWrappedCheckBoxPanel(strictMemoryReadCheckBox))
+            add(createWrappedCheckBoxPanel(showNotificationCheckBox))
+        }
+
+        // Page
+        val root = JPanel()
+        root.layout = BoxLayout(root, BoxLayout.Y_AXIS)
+        root.border = JBUI.Borders.empty(8)
+
+        root.add(constraintsPanel)
+        root.add(Box.createVerticalStrut(10))
+        root.add(filteringPanel)
+        root.add(Box.createVerticalStrut(10))
+        root.add(textPanel)
+        root.add(Box.createVerticalStrut(10))
+        root.add(behaviorPanel)
+
+        // Initialize visibility/enabled
         maxFilesField.isVisible = setMaxFilesCheckBox.isSelected
         warningLabel.isVisible = !setMaxFilesCheckBox.isSelected
-        filenameFiltersPanel.isVisible = useFilenameFiltersCheckBox.isSelected
-        infoLabel.isVisible = useFilenameFiltersCheckBox.isSelected && tableModel.rowCount == 0
+        updateIncludeEnabledState()
+        updateExcludeEnabledState()
 
-        return FormBuilder.createFormBuilder()
-            .addComponentFillVertically(createSection("Text structure of what's going to the clipboard") {
-                it.add(createLabeledPanel("Pre Text:", preTextArea), BorderLayout.NORTH)
-                it.add(createLabeledPanel("File Header Format:", headerFormatArea), BorderLayout.CENTER)
-                it.add(createLabeledPanel("Post Text:", postTextArea), BorderLayout.SOUTH)
-                it.add(createLabeledPanel("", extraLineCheckBox))
-            }, 0)
-            .addComponentFillVertically(createSection("Constraints for copying") {
-                it.add(createInlinePanel(createWrappedCheckBoxPanel(setMaxFilesCheckBox), maxFilesField))
-                it.add(createInlinePanel(JLabel(), warningLabel))
-                it.add(createLabeledPanel("Maximum file size (KB):", maxFileSizeField))
-                it.add(createInlinePanel(createWrappedCheckBoxPanel(useFilenameFiltersCheckBox), filenameFiltersPanel))
-                it.add(createInlinePanel(JLabel(), infoLabel))
-            }, 0)
-            .addComponentFillVertically(createSection("File Reading Behavior") {
-                it.add(strictMemoryReadCheckBox)
-                val helpLabel = JLabel("<html><small>When enabled, only reads file content from memory if the file is currently open in an editor tab.<br>" +
-                        "When disabled, reads from IntelliJ's document cache even if the tab is closed (better performance).</small></html>")
-                helpLabel.border = JBUI.Borders.emptyLeft(25)
-                it.add(helpLabel)
-            }, 0)
-            .addComponentFillVertically(createSection("Information on what has been copied") {
-                it.add(showNotificationCheckBox)
-            }, 0)
-            .panel
+        return root
     }
 
-    private fun createSectionDivider(title: String = ""): JPanel {
-        val panel = JPanel(BorderLayout())
-        panel.border = IdeBorderFactory.createTitledBorder(title, false, JBUI.insetsTop(20))
+    override fun getDisplayName(): String = "Copy File Content Settings"
 
+    // ---------- Apply / Reset / Modified ----------
+    override fun isModified(): Boolean {
+        return settings?.let { current ->
+            val s = current.state
+            val includeRules = includeTable.readRules()
+            val excludeRules = excludeTable.readRules()
+            headerFormatArea.text != s.headerFormat ||
+            preTextArea.text != s.preText ||
+            postTextArea.text != s.postText ||
+            extraLineCheckBox.isSelected != s.addExtraLineBetweenFiles ||
+            setMaxFilesCheckBox.isSelected != s.setMaxFileCount ||
+            (setMaxFilesCheckBox.isSelected && maxFilesField.text.toIntOrNull() != s.fileCountLimit) ||
+            maxFileSizeField.text.toIntOrNull() != s.maxFileSizeKB ||
+            showNotificationCheckBox.isSelected != s.showCopyNotification ||
+            useFilenameFiltersCheckBox.isSelected != s.useFilenameFilters ||
+            strictMemoryReadCheckBox.isSelected != s.strictMemoryRead ||
+            includeRules != s.includeRules ||
+            excludeRules != s.excludeRules ||
+            useExcludeRulesCheck.isSelected != s.useExcludeRules ||
+            matchDirectoriesCheck.isSelected != s.matchDirectories ||
+            matchHiddenFilesCheck.isSelected != s.matchHiddenFiles ||
+            overlapPolicyBox.selectedItem != s.overlapPolicy
+        } ?: false
+    }
+
+    override fun apply() {
+        settings?.let { current ->
+            val s = current.state
+            s.headerFormat = headerFormatArea.text
+            s.preText = preTextArea.text
+            s.postText = postTextArea.text
+            s.addExtraLineBetweenFiles = extraLineCheckBox.isSelected
+            s.setMaxFileCount = setMaxFilesCheckBox.isSelected
+            s.fileCountLimit = maxFilesField.text.toIntOrNull() ?: s.fileCountLimit
+            s.maxFileSizeKB = maxFileSizeField.text.toIntOrNull() ?: s.maxFileSizeKB
+            s.showCopyNotification = showNotificationCheckBox.isSelected
+            s.useFilenameFilters = useFilenameFiltersCheckBox.isSelected
+            s.strictMemoryRead = strictMemoryReadCheckBox.isSelected
+
+            s.includeRules = includeTable.readRules()
+            s.excludeRules = excludeTable.readRules()
+            s.useExcludeRules = useExcludeRulesCheck.isSelected
+            s.matchDirectories = matchDirectoriesCheck.isSelected
+            s.matchHiddenFiles = matchHiddenFilesCheck.isSelected
+            s.overlapPolicy = overlapPolicyBox.selectedItem as OverlapPolicy
+        }
+    }
+
+    override fun reset() {
+        settings?.let { current ->
+            val s = current.state
+            headerFormatArea.text = s.headerFormat
+            preTextArea.text = s.preText
+            postTextArea.text = s.postText
+            extraLineCheckBox.isSelected = s.addExtraLineBetweenFiles
+            setMaxFilesCheckBox.isSelected = s.setMaxFileCount
+            maxFilesField.text = s.fileCountLimit.toString()
+            maxFileSizeField.text = s.maxFileSizeKB.toString()
+            showNotificationCheckBox.isSelected = s.showCopyNotification
+            useFilenameFiltersCheckBox.isSelected = s.useFilenameFilters
+            strictMemoryReadCheckBox.isSelected = s.strictMemoryRead
+
+            includeTable.setRules(s.includeRules)
+            excludeTable.setRules(s.excludeRules)
+            useExcludeRulesCheck.isSelected = s.useExcludeRules
+            matchDirectoriesCheck.isSelected = s.matchDirectories
+            matchHiddenFilesCheck.isSelected = s.matchHiddenFiles
+            overlapPolicyBox.selectedItem = s.overlapPolicy
+
+            maxFilesField.isVisible = s.setMaxFileCount
+            warningLabel.isVisible = !s.setMaxFileCount
+            updateIncludeEnabledState()
+            updateExcludeEnabledState()
+            updateIncludeInfoVisibility()
+        }
+    }
+
+    // ---------- Builders ----------
+
+    private fun borderedSection(title: String, builder: JPanel.() -> Unit): JPanel {
+        val panel = JPanel()
+        panel.layout = BoxLayout(panel, BoxLayout.Y_AXIS)
+        panel.border = IdeBorderFactory.createTitledBorder(title, false, JBUI.insetsTop(12))
+        panel.builder()
         return panel
     }
 
-    private fun createInlinePanel(leftComponent: JComponent, rightComponent: JComponent, spacing: Int = 10): JPanel {
+    private fun labeledRow(title: String, component: JComponent): JPanel {
+        val row = JPanel(BorderLayout())
+        val label = JLabel(title)
+        label.border = JBUI.Borders.emptyBottom(4)
+        row.add(label, BorderLayout.NORTH)
+        row.add(component, BorderLayout.CENTER)
+        row.border = JBUI.Borders.emptyBottom(10)
+        return row
+    }
+
+    private fun inlineRow(left: JComponent, right: JComponent, spacing: Int = 10): JPanel {
         val panel = JPanel(BorderLayout())
-
-        val leftWrapper = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0))
-        leftWrapper.add(leftComponent)
-        leftWrapper.border = JBUI.Borders.emptyRight(spacing)
-
-        val rightWrapper = JPanel(BorderLayout())
-        rightWrapper.add(rightComponent, BorderLayout.CENTER)
-
-        panel.add(leftWrapper, BorderLayout.WEST)
-        panel.add(rightWrapper, BorderLayout.CENTER)
-
+        val leftWrap = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0))
+        leftWrap.add(left)
+        leftWrap.border = JBUI.Borders.emptyRight(spacing)
+        panel.add(leftWrap, BorderLayout.WEST)
+        panel.add(right, BorderLayout.CENTER)
+        panel.border = JBUI.Borders.emptyBottom(10)
         return panel
     }
 
     private fun createWrappedCheckBoxPanel(checkBox: JBCheckBox, paddingTop: Int = 4): JPanel {
         val panel = JPanel(BorderLayout())
-        panel.border = JBUI.Borders.emptyTop(paddingTop)
-        panel.add(checkBox)
+        panel.border = JBUI.Borders.emptyTop(paddingTop).let { JBUI.Borders.merge(it, JBUI.Borders.emptyBottom(10), true) }
+        panel.add(checkBox, BorderLayout.WEST)
         return panel
     }
 
-    private fun createCollapsibleSection(title: String = "", content: (JPanel) -> Unit): JPanel {
-        val collapsiblePanel = JPanel(BorderLayout())
-        content(collapsiblePanel)
-
-        val panel = JPanel(BorderLayout())
-        val titleBorder = IdeBorderFactory.createTitledBorder(title, false, JBUI.insetsTop(8))
-        panel.border = titleBorder
-        panel.add(CollapsiblePanel(title, collapsiblePanel), BorderLayout.CENTER)
-
-        return panel
-    }
-
-    private fun createSection(title: String = "", content: (JPanel) -> Unit): JPanel {
-        val panel = JPanel(BorderLayout())
-        val sectionContent = Box.createVerticalBox()
-
-        // Panel to contain the inner content
-        val contentPanel = JPanel()
-        contentPanel.layout = BoxLayout(contentPanel, BoxLayout.Y_AXIS)
-        contentPanel.border = JBUI.Borders.emptyRight(10)
-        content(contentPanel)
-
-        // Add margin to each component inside the content panel
-        for (component in contentPanel.components) {
-            if (component is JComponent) {
-                component.border = JBUI.Borders.emptyBottom(10)
+    // Tabs for Include / Exclude with native toolbar decorators
+    private fun buildFilteringTabs(): JComponent {
+        // Include tab
+        val includePresetAction = object : com.intellij.ui.AnActionButton("Apply Preset…") {
+            override fun actionPerformed(e: com.intellij.openapi.actionSystem.AnActionEvent) {
+                val merged = (includeTable.readRules() + RulePresets.CommonSourceFiles).distinct()
+                includeTable.setRules(merged)
+                useFilenameFiltersCheckBox.isSelected = true
+                updateIncludeEnabledState()
+                updateIncludeInfoVisibility()
             }
         }
+        includeDecorated = ToolbarDecorator.createDecorator(includeTable)
+            .setAddAction { includeTable.addEmptyRow() }
+            .setRemoveAction { includeTable.removeSelectedRow() }
+            .disableUpAction().disableDownAction()
+            .addExtraAction(includePresetAction)
+            .createPanel()
 
-        sectionContent.add(contentPanel)
+        val includeTopRow = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply {
+            add(useFilenameFiltersCheckBox)
+        }
+        val includeTab = JPanel(BorderLayout(0, 6)).apply {
+            border = JBUI.Borders.empty(6, 0, 0, 0)
+            add(includeTopRow, BorderLayout.NORTH)
+            add(includeDecorated, BorderLayout.CENTER)
+            add(includeInfoLabel, BorderLayout.SOUTH)
+        }
 
-        val divider = createSectionDivider(title)
-        panel.add(divider, BorderLayout.NORTH)
-        panel.add(sectionContent, BorderLayout.CENTER)
-
-        return panel
-    }
-
-    private fun createCollapsibleTextInputsPanel(): JPanel {
-        val panel = JPanel(BorderLayout())
-        val titleBorder = IdeBorderFactory.createTitledBorder("Text Options", false, JBUI.insetsTop(8))
-        panel.border = titleBorder
-
-        val collapsiblePanel = JPanel(BorderLayout())
-        collapsiblePanel.add(createLabeledPanel("Pre Text:", preTextArea), BorderLayout.NORTH)
-        collapsiblePanel.add(createLabeledPanel("File Header Format:", headerFormatArea), BorderLayout.CENTER)
-        collapsiblePanel.add(createLabeledPanel("Post Text:", postTextArea), BorderLayout.SOUTH)
-
-        panel.add(CollapsiblePanel("Text Options", collapsiblePanel), BorderLayout.CENTER)
-
-        return panel
-    }
-
-    class CollapsiblePanel(private val title: String, content: JPanel) : JPanel(BorderLayout()) {
-        private val toggleButton: JButton = JButton(title)
-
-        init {
-            toggleButton.isContentAreaFilled = false
-            toggleButton.isOpaque = false
-            toggleButton.border = BorderFactory.createEmptyBorder()
-            toggleButton.margin = JBUI.emptyInsets()
-            toggleButton.horizontalAlignment = SwingConstants.LEFT
-            toggleButton.preferredSize = Dimension(0, 24)
-
-            toggleButton.addActionListener {
-                content.isVisible = !content.isVisible
-                updateToggleButtonText(content.isVisible)
+        // Exclude tab
+        val excludePresetAction = object : com.intellij.ui.AnActionButton("Apply Preset…") {
+            override fun actionPerformed(e: com.intellij.openapi.actionSystem.AnActionEvent) {
+                val merged = (excludeTable.readRules() + RulePresets.IgnoreBuildOutputs).distinct()
+                excludeTable.setRules(merged)
+                useExcludeRulesCheck.isSelected = true
+                updateExcludeEnabledState()
             }
-            updateToggleButtonText(content.isVisible)
+        }
+        excludeDecorated = ToolbarDecorator.createDecorator(excludeTable)
+            .setAddAction { excludeTable.addEmptyRow() }
+            .setRemoveAction { excludeTable.removeSelectedRow() }
+            .disableUpAction().disableDownAction()
+            .addExtraAction(excludePresetAction)
+            .createPanel()
 
-            val headerPanel = JPanel(BorderLayout())
-            headerPanel.add(toggleButton, BorderLayout.WEST)
-            headerPanel.border = JBUI.Borders.empty(4, 0)
-
-            add(headerPanel, BorderLayout.NORTH)
-            add(content, BorderLayout.CENTER)
+        val excludeTopRow = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply {
+            add(useExcludeRulesCheck)
+        }
+        val excludeTab = JPanel(BorderLayout(0, 6)).apply {
+            border = JBUI.Borders.empty(6, 0, 0, 0)
+            add(excludeTopRow, BorderLayout.NORTH)
+            add(excludeDecorated, BorderLayout.CENTER)
         }
 
-        private fun updateToggleButtonText(expanded: Boolean) {
-            toggleButton.text = if (expanded) "▼ $title" else "▶ $title"
+        val tabs = JBTabbedPane(SwingConstants.TOP)
+        tabs.addTab("Include", includeTab)
+        tabs.addTab("Exclude", excludeTab)
+
+        return tabs
+    }
+
+    private fun buildFilteringGlobalRow(): JComponent {
+        val row = JPanel(HorizontalLayout(12))
+        row.border = JBUI.Borders.emptyTop(6)
+        row.add(matchDirectoriesCheck)
+        row.add(matchHiddenFilesCheck)
+
+        // overlap policy inline
+        val policyPanel = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0))
+        policyPanel.add(JLabel("Overlap policy:"))
+        policyPanel.add(overlapPolicyBox)
+        row.add(policyPanel)
+
+        row.add(Box.createHorizontalStrut(12))
+        row.add(previewButton)
+        return row
+    }
+
+    // ---------- UI state helpers ----------
+    private fun updateIncludeEnabledState() {
+        val enabled = useFilenameFiltersCheckBox.isSelected
+        if (this::includeDecorated.isInitialized) UIUtil.setEnabled(includeDecorated, enabled, true)
+        updateIncludeInfoVisibility()
+    }
+
+    private fun updateExcludeEnabledState() {
+        val enabled = useExcludeRulesCheck.isSelected
+        if (this::excludeDecorated.isInitialized) UIUtil.setEnabled(excludeDecorated, enabled, true)
+    }
+
+    private fun updateIncludeInfoVisibility() {
+        includeInfoLabel.isVisible = useFilenameFiltersCheckBox.isSelected && includeTable.modelImpl.rowCount == 0
+    }
+
+    private fun openPreviewDialog() {
+        val descriptor = com.intellij.openapi.fileChooser.FileChooserDescriptor(true, true, false, false, false, false).apply {
+            title = "Select root to preview"
         }
-    }
-
-    private fun createFilenameFiltersPanel(): JPanel {
-        val panel = JPanel(BorderLayout())
-
-        val scrollPane = JBScrollPane(table)
-        scrollPane.preferredSize = Dimension(250, 100)
-        panel.add(scrollPane, BorderLayout.CENTER)
-
-        val buttonPanel = JPanel(FlowLayout(FlowLayout.LEFT))
-        buttonPanel.add(addButton)
-        buttonPanel.add(removeButton)
-        panel.add(buttonPanel, BorderLayout.SOUTH)
-
-        return panel
-    }
-
-    private fun createLabeledPanel(title: String, component: JComponent): JPanel {
-        val label = JLabel(title)
-        label.border = JBUI.Borders.emptyBottom(4)
-
-        val panel = JPanel(BorderLayout())
-        panel.add(label, BorderLayout.NORTH)
-        panel.add(component, BorderLayout.CENTER)
-
-        return panel
-    }
-
-    override fun isModified(): Boolean {
-        return settings?.let {
-            val currentFilters = List(tableModel.rowCount) { row -> tableModel.getValueAt(row, 0) as String }
-            it.state.filenameFilters != currentFilters ||
-                    headerFormatArea.text != it.state.headerFormat ||
-                    preTextArea.text != it.state.preText ||
-                    postTextArea.text != it.state.postText ||
-                    extraLineCheckBox.isSelected != it.state.addExtraLineBetweenFiles ||
-                    setMaxFilesCheckBox.isSelected != it.state.setMaxFileCount ||
-                    (setMaxFilesCheckBox.isSelected && maxFilesField.text.toIntOrNull() != it.state.fileCountLimit) ||
-                    maxFileSizeField.text.toIntOrNull() != it.state.maxFileSizeKB ||
-                    showNotificationCheckBox.isSelected != it.state.showCopyNotification ||
-                    useFilenameFiltersCheckBox.isSelected != it.state.useFilenameFilters ||
-                    strictMemoryReadCheckBox.isSelected != it.state.strictMemoryRead
-        } ?: false
-    }
-
-    override fun apply() {
-        settings?.let {
-            it.state.filenameFilters = List(tableModel.rowCount) { row -> tableModel.getValueAt(row, 0) as String }
-            it.state.headerFormat = headerFormatArea.text
-            it.state.preText = preTextArea.text
-            it.state.postText = postTextArea.text
-            it.state.addExtraLineBetweenFiles = extraLineCheckBox.isSelected
-            it.state.setMaxFileCount = setMaxFilesCheckBox.isSelected
-            it.state.fileCountLimit = maxFilesField.text.toIntOrNull() ?: 50
-            it.state.maxFileSizeKB = maxFileSizeField.text.toIntOrNull() ?: 500
-            it.state.showCopyNotification = showNotificationCheckBox.isSelected
-            it.state.useFilenameFilters = useFilenameFiltersCheckBox.isSelected
-            it.state.strictMemoryRead = strictMemoryReadCheckBox.isSelected
-        }
-    }
-
-    override fun getDisplayName(): String = "Copy File Content Settings"
-
-    override fun reset() {
-        settings?.let {
-            headerFormatArea.text = it.state.headerFormat
-            preTextArea.text = it.state.preText
-            postTextArea.text = it.state.postText
-            extraLineCheckBox.isSelected = it.state.addExtraLineBetweenFiles
-            setMaxFilesCheckBox.isSelected = it.state.setMaxFileCount
-            maxFilesField.text = it.state.fileCountLimit.toString()
-            maxFileSizeField.text = it.state.maxFileSizeKB.toString()
-            showNotificationCheckBox.isSelected = it.state.showCopyNotification
-            useFilenameFiltersCheckBox.isSelected = it.state.useFilenameFilters
-            strictMemoryReadCheckBox.isSelected = it.state.strictMemoryRead
-            tableModel.setRowCount(0)
-            it.state.filenameFilters.forEach { filter ->
-                tableModel.addRow(arrayOf(filter))
-            }
-            maxFilesField.isVisible = it.state.setMaxFileCount
-            warningLabel.isVisible = !it.state.setMaxFileCount
-            filenameFiltersPanel.isVisible = it.state.useFilenameFilters
-            updateInfoLabelVisibility()
-        }
+        val chosen = com.intellij.openapi.fileChooser.FileChooser.chooseFile(descriptor, project, null) ?: return
+        val stateSnapshot = settings?.state?.copy(
+            includeRules = includeTable.readRules(),
+            excludeRules = excludeTable.readRules(),
+            useExcludeRules = useExcludeRulesCheck.isSelected,
+            matchDirectories = matchDirectoriesCheck.isSelected,
+            matchHiddenFiles = matchHiddenFilesCheck.isSelected,
+            overlapPolicy = overlapPolicyBox.selectedItem as OverlapPolicy,
+            useFilenameFilters = useFilenameFiltersCheckBox.isSelected,
+        ) ?: return
+        val projectRoot = ProjectRootManager.getInstance(project).contentRoots.firstOrNull()
+        FilterPreviewDialog(project, chosen) { _ ->
+            com.github.mwguerra.copyfilecontent.filter.FilterEngine(stateSnapshot, projectRoot ?: chosen)
+        }.show()
     }
 }
